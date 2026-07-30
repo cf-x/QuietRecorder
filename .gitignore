@@ -1,0 +1,13 @@
+.DS_Store
+.build/
+.swiftpm/
+
+*.log
+*.mov
+*.mp4
+*.telemetry.json
+
+# Local execution evidence; not part of the public source distribution.
+ADVERSARIAL_REVIEW.md
+BLOCKED.md
+PROGRESS.md
