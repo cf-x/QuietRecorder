@@ -10,6 +10,7 @@ QuietRecorder 是一款极简的原生 macOS 后台录屏 Agent。它通过一�
 - 主显示器固定输出 1280x720、约 15 FPS 的 HEVC/H.265 视频。
 - 系统声音与 Mac 内置麦克风混合为一条 AAC 96 kbps 音轨。
 - 蓝牙耳机只负责播放；QuietRecorder 不启用蓝牙耳机麦克风，也不修改系统默认输入。
+- 检测蓝牙通话与系统音频路由变化，自动重建并验证 ScreenCaptureKit 系统音频捕获。
 - MP4 与 telemetry sidecar 在成功收尾后原子发布，不覆盖已有录像。
 - 录制期间没有应用窗口、悬浮控件、Dock 图标或菜单栏项目。
 
@@ -70,6 +71,7 @@ Acceptance/run_all.sh /Applications/QuietRecorder.app . PID RECORDING.mp4
 - 参数固定在源码中，没有设置页、多显示器选择、摄像头、云同步或自动更新。
 - 强制结束进程或断电无法执行安全收尾，可能留下隐藏的 partial 文件；正常停止和 `SIGTERM` 会执行混音与清理。
 - 如果其他应用启用蓝牙耳机麦克风，蓝牙播放质量仍可能下降；QuietRecorder 只能保证自己始终选择 Mac 内置麦克风。
+- 路由恢复次数记录在 telemetry 的 `systemAudioRecoveryCount` 字段；两次恢复后系统声仍低于 -70 dBFS 时会写入警告日志并继续录制，以免正常静音导致成片丢失。
 - 本项目不会隐藏 macOS 的紫色或橙色隐私指示。使用录屏和录音功能时，请遵守当地法律并取得必要同意。
 
 ## 许可证

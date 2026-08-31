@@ -38,6 +38,7 @@ final class RecordingController: NSObject {
     private let sampleQueue = DispatchQueue(label: "com.fangchenfang.QuietRecorder.samples")
     private let capturePipeline = CapturePipeline()
     private var stream: SCStream?
+    private var streamConfiguration: SCStreamConfiguration?
     private var captureURL: URL?
     private var finalPartialURL: URL?
     private var telemetryPartialURL: URL?
@@ -49,6 +50,12 @@ final class RecordingController: NSObject {
     private var deviceTimer: Timer?
     private var stopWatchdog: Timer?
     private var selectedMicrophone: AVCaptureDevice?
+    private var audioRouteSnapshot: CoreAudioRouteSnapshot?
+    private var audioRecoveryTask: Task<Void, Never>?
+    private var audioRecoveryValidationTask: Task<Void, Never>?
+    private var audioRecoveryInProgress = false
+    private var audioRecoveryAttempt = 0
+    private var audioRouteGeneration = 0
 
     override init() {
         super.init()
@@ -99,7 +106,9 @@ final class RecordingController: NSObject {
             configuration.capturesAudio = true
             configuration.sampleRate = 48_000
             configuration.channelCount = 2
-            configuration.excludesCurrentProcessAudio = true
+            // QuietRecorder never emits audio. Avoiding an unnecessary
+            // per-process exclusion keeps the tap simpler during route rebuilds.
+            configuration.excludesCurrentProcessAudio = false
             configuration.captureMicrophone = true
 
             let microphone = try selectBuiltInMicrophone()
@@ -119,6 +128,7 @@ final class RecordingController: NSObject {
             try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: sampleQueue)
             try stream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: sampleQueue)
             self.stream = stream
+            streamConfiguration = configuration
 
             try await stream.startCapture()
             capturePipeline.markCaptureStarted()
@@ -129,6 +139,7 @@ final class RecordingController: NSObject {
             cancelCapturePipeline()
             cleanupPartialFiles()
             stream = nil
+            streamConfiguration = nil
             selectedMicrophone = nil
             transition(to: .idle)
             logger.log("recording start failed: \(error.localizedDescription)")
@@ -247,6 +258,8 @@ final class RecordingController: NSObject {
     }
 
     private func startMonitors() {
+        audioRouteSnapshot = CoreAudioRouteSnapshot.current()
+        logger.log("audio route baseline: \(audioRouteSnapshot?.description ?? "unavailable")")
         diskTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
@@ -254,13 +267,28 @@ final class RecordingController: NSObject {
                 catch { self.abortAndStop("disk monitor: \(error.localizedDescription)") }
             }
         }
-        deviceTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+        deviceTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.state == .recording else { return }
                 if self.selectedMicrophone?.isConnected != true {
                     self.abortAndStop("selected built-in microphone disconnected while recording")
-                } else if let track = self.capturePipeline.stalledTrack(maximumSilenceSeconds: 6) {
-                    self.abortAndStop("\(track) samples stopped for at least 6 seconds")
+                    return
+                }
+
+                let currentRoute = CoreAudioRouteSnapshot.current()
+                if let previousRoute = self.audioRouteSnapshot,
+                   let reason = currentRoute.recoveryReason(comparedTo: previousRoute) {
+                    self.audioRouteSnapshot = currentRoute
+                    self.audioRouteGeneration += 1
+                    self.audioRecoveryAttempt = 0
+                    self.requestSystemAudioRecovery(reason: reason, generation: self.audioRouteGeneration)
+                } else {
+                    self.audioRouteSnapshot = currentRoute
+                }
+
+                if !self.audioRecoveryInProgress,
+                   let track = self.capturePipeline.stalledTrack(maximumSilenceSeconds: 8) {
+                    self.abortAndStop("\(track) samples stopped for at least 8 seconds")
                 }
             }
         }
@@ -271,6 +299,97 @@ final class RecordingController: NSObject {
         deviceTimer?.invalidate()
         diskTimer = nil
         deviceTimer = nil
+        audioRecoveryTask?.cancel()
+        audioRecoveryValidationTask?.cancel()
+        audioRecoveryTask = nil
+        audioRecoveryValidationTask = nil
+        audioRecoveryInProgress = false
+        audioRouteSnapshot = nil
+    }
+
+    private func requestSystemAudioRecovery(reason: String, generation: Int) {
+        guard state == .recording,
+              !audioRecoveryInProgress,
+              let stream,
+              let configuration = streamConfiguration else { return }
+        audioRecoveryAttempt += 1
+        let attempt = audioRecoveryAttempt
+        audioRecoveryInProgress = true
+        capturePipeline.beginSystemAudioRecoveryValidation()
+        logger.log(
+            "audio route changed; rebuilding system audio capture " +
+            "(attempt \(attempt), generation \(generation)): \(reason)"
+        )
+
+        audioRecoveryTask?.cancel()
+        audioRecoveryTask = Task { @MainActor [weak self, weak stream] in
+            guard let self, let stream else { return }
+            await self.rebuildSystemAudioCapture(
+                stream: stream,
+                configuration: configuration,
+                generation: generation,
+                attempt: attempt
+            )
+        }
+    }
+
+    private func rebuildSystemAudioCapture(
+        stream: SCStream,
+        configuration: SCStreamConfiguration,
+        generation: Int,
+        attempt: Int
+    ) async {
+        defer { audioRecoveryInProgress = false }
+        do {
+            configuration.capturesAudio = false
+            try await stream.updateConfiguration(configuration)
+            try await Task<Never, Never>.sleep(nanoseconds: 200_000_000)
+            guard state == .recording, self.stream === stream else {
+                configuration.capturesAudio = true
+                return
+            }
+            configuration.capturesAudio = true
+            try await stream.updateConfiguration(configuration)
+            logger.log("system audio capture rebuilt (attempt \(attempt), generation \(generation))")
+            scheduleSystemAudioRecoveryValidation(generation: generation, attempt: attempt)
+        } catch is CancellationError {
+            configuration.capturesAudio = true
+        } catch {
+            configuration.capturesAudio = true
+            guard state == .recording, self.stream === stream else { return }
+            abortAndStop("system audio capture rebuild failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func scheduleSystemAudioRecoveryValidation(generation: Int, attempt: Int) {
+        audioRecoveryValidationTask?.cancel()
+        audioRecoveryValidationTask = Task { @MainActor [weak self] in
+            do { try await Task<Never, Never>.sleep(nanoseconds: 6_000_000_000) }
+            catch { return }
+            guard let self,
+                  self.state == .recording,
+                  self.audioRouteGeneration == generation else { return }
+
+            let validation = self.capturePipeline.systemAudioRecoveryValidation()
+            if validation.hasUsableSignal {
+                self.logger.log(
+                    "system audio recovery validated: buffers=\(validation.sampleBufferCount) " +
+                    "rms=\(String(format: "%.8f", validation.rms))"
+                )
+            } else if attempt < 2 {
+                self.requestSystemAudioRecovery(
+                    reason: "post-rebuild signal remained below -70 dBFS " +
+                    "(buffers=\(validation.sampleBufferCount), rms=\(String(format: "%.8f", validation.rms)))",
+                    generation: generation
+                )
+            } else {
+                self.logger.log(
+                    "warning: system audio stayed below -70 dBFS after two rebuilds; " +
+                    "recording continues because the source may be legitimately silent " +
+                    "(buffers=\(validation.sampleBufferCount), rms=\(String(format: "%.8f", validation.rms)))"
+                )
+            }
+        }
     }
 
     private func abortAndStop(_ reason: String) {
@@ -346,6 +465,7 @@ final class RecordingController: NSObject {
             microphoneSampleCount: snapshot.microphoneSampleCount,
             systemAudioEnergy: snapshot.systemEnergy,
             microphoneAudioEnergy: snapshot.microphoneEnergy,
+            systemAudioRecoveryCount: snapshot.systemAudioRecoveryCount,
             recorder: "AVAssetWriter+AVAssetReaderAudioMixOutput",
             startedAt: startedAt,
             finishedAt: Date()
@@ -375,12 +495,15 @@ final class RecordingController: NSObject {
 
     private func resetAfterFinalization() {
         stream = nil
+        streamConfiguration = nil
         selectedMicrophone = nil
         captureURL = nil
         finalPartialURL = nil
         telemetryPartialURL = nil
         finalURL = nil
         abortReason = nil
+        audioRecoveryAttempt = 0
+        audioRouteGeneration = 0
         transition(to: .idle)
     }
 

@@ -6,6 +6,7 @@ struct RecordingTelemetry: Codable {
     let microphoneSampleCount: Int
     let systemAudioEnergy: Double
     let microphoneAudioEnergy: Double
+    let systemAudioRecoveryCount: Int
     let recorder: String
     let startedAt: Date
     let finishedAt: Date
@@ -17,6 +18,7 @@ final class AudioTelemetryAccumulator: @unchecked Sendable {
         let microphoneSampleCount: Int
         let systemEnergy: Double
         let microphoneEnergy: Double
+        let systemAudioRecoveryCount: Int
     }
 
     private let lock = NSLock()
@@ -26,6 +28,7 @@ final class AudioTelemetryAccumulator: @unchecked Sendable {
     private var systemEnergyValueCount = 0
     private var microphoneEnergySum = 0.0
     private var microphoneEnergyValueCount = 0
+    private var systemAudioRecoveryCount = 0
 
     func reset() {
         lock.lock()
@@ -36,6 +39,7 @@ final class AudioTelemetryAccumulator: @unchecked Sendable {
         systemEnergyValueCount = 0
         microphoneEnergySum = 0
         microphoneEnergyValueCount = 0
+        systemAudioRecoveryCount = 0
     }
 
     func addSystem(sum: Double, count: Int) {
@@ -54,6 +58,12 @@ final class AudioTelemetryAccumulator: @unchecked Sendable {
         microphoneEnergyValueCount += count
     }
 
+    func noteSystemAudioRecovery() {
+        lock.lock()
+        systemAudioRecoveryCount += 1
+        lock.unlock()
+    }
+
     func snapshot() -> Snapshot {
         lock.lock()
         defer { lock.unlock() }
@@ -61,7 +71,8 @@ final class AudioTelemetryAccumulator: @unchecked Sendable {
             systemSampleCount: systemSampleCount,
             microphoneSampleCount: microphoneSampleCount,
             systemEnergy: systemEnergyValueCount == 0 ? 0 : sqrt(systemEnergySum / Double(systemEnergyValueCount)),
-            microphoneEnergy: microphoneEnergyValueCount == 0 ? 0 : sqrt(microphoneEnergySum / Double(microphoneEnergyValueCount))
+            microphoneEnergy: microphoneEnergyValueCount == 0 ? 0 : sqrt(microphoneEnergySum / Double(microphoneEnergyValueCount)),
+            systemAudioRecoveryCount: systemAudioRecoveryCount
         )
     }
 }

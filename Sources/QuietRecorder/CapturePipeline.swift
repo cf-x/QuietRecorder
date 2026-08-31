@@ -116,8 +116,8 @@ final class CapturePipeline: @unchecked Sendable {
                 maximumBackpressureSeconds: 5
             )
         case .audio:
-            health.noteSystemAudio()
             let energy = Self.energy(in: sampleBuffer)
+            health.noteSystemAudio(sum: energy.sum, count: energy.count)
             telemetry.addSystem(sum: energy.sum, count: energy.count)
             guard isStrictlyAfterLastSample(presentationTime, state: systemAudioState, label: "system audio"),
                   startSessionIfNeeded(at: presentationTime, writer: writer) else { return }
@@ -180,6 +180,15 @@ final class CapturePipeline: @unchecked Sendable {
 
     func markCaptureStarted() {
         health.markCaptureStarted()
+    }
+
+    func beginSystemAudioRecoveryValidation() {
+        health.beginSystemAudioRecoveryValidation()
+        telemetry.noteSystemAudioRecovery()
+    }
+
+    func systemAudioRecoveryValidation() -> CaptureHealthTracker.SystemAudioValidation {
+        health.systemAudioRecoveryValidation()
     }
 
     func stalledTrack(maximumSilenceSeconds: TimeInterval) -> String? {
@@ -393,11 +402,24 @@ private final class WriterFinishContext: @unchecked Sendable {
     }
 }
 
-private final class CaptureHealthTracker: @unchecked Sendable {
+final class CaptureHealthTracker: @unchecked Sendable {
+    struct SystemAudioValidation: Equatable {
+        let sampleBufferCount: Int
+        let rms: Double
+
+        var hasUsableSignal: Bool {
+            sampleBufferCount > 0 && rms >= 0.000_316
+        }
+    }
+
     private let lock = NSLock()
     private var captureStartedUptime: TimeInterval?
     private var lastSystemAudioUptime: TimeInterval?
     private var lastMicrophoneUptime: TimeInterval?
+    private var validationEnergySum = 0.0
+    private var validationValueCount = 0
+    private var validationSampleBufferCount = 0
+    private var validationActive = false
 
     func reset() {
         lock.lock()
@@ -405,6 +427,10 @@ private final class CaptureHealthTracker: @unchecked Sendable {
         captureStartedUptime = nil
         lastSystemAudioUptime = nil
         lastMicrophoneUptime = nil
+        validationEnergySum = 0
+        validationValueCount = 0
+        validationSampleBufferCount = 0
+        validationActive = false
     }
 
     func markCaptureStarted() {
@@ -415,8 +441,16 @@ private final class CaptureHealthTracker: @unchecked Sendable {
         }
     }
 
-    func noteSystemAudio() {
-        note { lastSystemAudioUptime = $0 }
+    func noteSystemAudio(sum: Double, count: Int) {
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        lastSystemAudioUptime = now
+        if validationActive {
+            validationEnergySum += sum
+            validationValueCount += count
+            validationSampleBufferCount += 1
+        }
+        lock.unlock()
     }
 
     func noteMicrophone() {
@@ -436,6 +470,30 @@ private final class CaptureHealthTracker: @unchecked Sendable {
             return label
         }
         return nil
+    }
+
+    func beginSystemAudioRecoveryValidation() {
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        lastSystemAudioUptime = now
+        validationEnergySum = 0
+        validationValueCount = 0
+        validationSampleBufferCount = 0
+        validationActive = true
+        lock.unlock()
+    }
+
+    func systemAudioRecoveryValidation() -> SystemAudioValidation {
+        lock.lock()
+        defer { lock.unlock() }
+        validationActive = false
+        let rms = validationValueCount == 0
+            ? 0
+            : sqrt(validationEnergySum / Double(validationValueCount))
+        return SystemAudioValidation(
+            sampleBufferCount: validationSampleBufferCount,
+            rms: rms
+        )
     }
 
     private func note(_ update: (TimeInterval) -> Void) {

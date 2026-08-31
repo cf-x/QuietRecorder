@@ -69,8 +69,11 @@ Task {
         guard telemetry.systemAudioSampleCount > 0, telemetry.microphoneSampleCount > 0 else {
             fail("both real ScreenCaptureKit audio output types must contain samples")
         }
-        guard telemetry.systemAudioEnergy > 0.000001, telemetry.microphoneAudioEnergy > 0.000001 else {
-            fail("both real audio inputs must contain non-silent PCM energy")
+        guard telemetry.systemAudioEnergy >= 0.000316 else {
+            fail("system audio energy \(telemetry.systemAudioEnergy) is below -70 dBFS")
+        }
+        guard telemetry.microphoneAudioEnergy > 0.000001 else {
+            fail("microphone input must contain non-silent PCM energy")
         }
 
         let values = try recordingURL.resourceValues(forKeys: [.fileSizeKey])
