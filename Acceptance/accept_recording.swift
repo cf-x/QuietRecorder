@@ -9,6 +9,7 @@ struct Telemetry: Decodable {
     let microphoneSampleCount: Int
     let systemAudioEnergy: Double
     let microphoneAudioEnergy: Double
+    let audioTrackLayout: [String]
 }
 
 func fail(_ message: String) -> Never {
@@ -51,12 +52,37 @@ Task {
         }
 
         let audioTracks = try await asset.loadTracks(withMediaType: .audio)
-        guard audioTracks.count == 1, let audio = audioTracks.first else {
-            fail("expected exactly one mixed audio track, found \(audioTracks.count)")
+        guard audioTracks.count == 3 else {
+            fail("expected mixed, system, and microphone audio tracks, found \(audioTracks.count)")
         }
-        let audioFormats = try await audio.load(.formatDescriptions)
-        guard audioFormats.contains(where: { CMFormatDescriptionGetMediaSubType($0) == kAudioFormatMPEG4AAC }) else {
-            fail("mixed audio codec is not AAC")
+        let expectedAudioTracks = [
+            (title: "mixed", channels: UInt32(2), enabled: true),
+            (title: "system", channels: UInt32(2), enabled: false),
+            (title: "microphone", channels: UInt32(1), enabled: false)
+        ]
+        for (audio, expected) in zip(audioTracks, expectedAudioTracks) {
+            let audioFormats = try await audio.load(.formatDescriptions)
+            guard audioFormats.contains(where: { CMFormatDescriptionGetMediaSubType($0) == kAudioFormatMPEG4AAC }) else {
+                fail("\(expected.title) audio codec is not AAC")
+            }
+            guard let format = audioFormats.first,
+                  let description = CMAudioFormatDescriptionGetStreamBasicDescription(format),
+                  description.pointee.mChannelsPerFrame == expected.channels else {
+                fail("\(expected.title) audio channel count is wrong")
+            }
+            let commonMetadata = try await audio.load(.commonMetadata)
+            let titleItems = AVMetadataItem.metadataItems(
+                from: commonMetadata,
+                filteredByIdentifier: .commonIdentifierTitle
+            )
+            let title = try await titleItems.first?.load(.stringValue)
+            guard title == expected.title else {
+                fail("audio track title is \(title ?? "missing"), expected \(expected.title)")
+            }
+            let enabled = try await audio.load(.isEnabled)
+            guard enabled == expected.enabled else {
+                fail("\(expected.title) enabled=\(enabled), expected \(expected.enabled)")
+            }
         }
 
         guard FileManager.default.fileExists(atPath: telemetryURL.path) else {
@@ -65,6 +91,9 @@ Task {
         let telemetry = try JSONDecoder().decode(Telemetry.self, from: Data(contentsOf: telemetryURL))
         guard telemetry.finalizationStatus == "completed" else {
             fail("recording was not finalized successfully")
+        }
+        guard telemetry.audioTrackLayout == expectedAudioTracks.map(\.title) else {
+            fail("telemetry audioTrackLayout does not match the MP4 tracks")
         }
         guard telemetry.systemAudioSampleCount > 0, telemetry.microphoneSampleCount > 0 else {
             fail("both real ScreenCaptureKit audio output types must contain samples")
@@ -86,7 +115,7 @@ Task {
 
         print("PASS: duration=\(String(format: "%.3f", duration))s")
         print("PASS: video=1280x720 HEVC nominalFPS=\(String(format: "%.3f", frameRate))")
-        print("PASS: audioTracks=1 codec=AAC systemSamples=\(telemetry.systemAudioSampleCount) microphoneSamples=\(telemetry.microphoneSampleCount)")
+        print("PASS: audioTracks=mixed(default),system,microphone codec=AAC systemSamples=\(telemetry.systemAudioSampleCount) microphoneSamples=\(telemetry.microphoneSampleCount)")
         print("PASS: systemEnergy=\(telemetry.systemAudioEnergy) microphoneEnergy=\(telemetry.microphoneAudioEnergy)")
         print("PASS: fileBytes=\(fileSize) projectedMiBPerHour=\(String(format: "%.3f", projectedBytesPerHour / 1024 / 1024))")
         exit(0)

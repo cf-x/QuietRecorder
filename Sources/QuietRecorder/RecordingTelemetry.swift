@@ -8,6 +8,7 @@ struct RecordingTelemetry: Codable {
     let microphoneAudioEnergy: Double
     let systemAudioRecoveryCount: Int
     let recorder: String
+    let audioTrackLayout: [String]
     let startedAt: Date
     let finishedAt: Date
 }

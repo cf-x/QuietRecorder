@@ -40,6 +40,7 @@ final class RecordingController: NSObject {
     private var stream: SCStream?
     private var streamConfiguration: SCStreamConfiguration?
     private var captureURL: URL?
+    private var mixedPartialURL: URL?
     private var finalPartialURL: URL?
     private var telemetryPartialURL: URL?
     private var finalURL: URL?
@@ -118,6 +119,7 @@ final class RecordingController: NSObject {
 
             let urls = try makeOutputURLs()
             captureURL = urls.capture
+            mixedPartialURL = urls.mixedPartial
             finalPartialURL = urls.finalPartial
             telemetryPartialURL = urls.telemetryPartial
             finalURL = urls.final
@@ -187,7 +189,7 @@ final class RecordingController: NSObject {
             abortReason = abortReason ?? "capture writer finish failed: \(error.localizedDescription)"
             failFinalization(abortReason ?? error.localizedDescription)
         case .success:
-            guard abortReason == nil, let captureURL, let finalPartialURL else {
+            guard abortReason == nil, let captureURL, let mixedPartialURL, let finalPartialURL else {
                 failFinalization(abortReason ?? "finalization URLs are missing")
                 return
             }
@@ -197,19 +199,23 @@ final class RecordingController: NSObject {
                 failFinalization("finalization disk check failed: \(error.localizedDescription)")
                 return
             }
-            logger.log("temporary HEVC and two-track AAC capture finished; starting one-track audio mix")
-            RecordingFinalizer.mix(captureURL: captureURL, outputURL: finalPartialURL) { [weak self] result in
+            logger.log("temporary HEVC and two-track AAC capture finished; creating mixed, system, and microphone tracks")
+            RecordingFinalizer.finalize(
+                captureURL: captureURL,
+                mixedURL: mixedPartialURL,
+                outputURL: finalPartialURL
+            ) { [weak self] result in
                 guard let self else { return }
-                DispatchQueue.main.async { self.mixFinished(result, recordingID: recordingID) }
+                DispatchQueue.main.async { self.finalizationFinished(result, recordingID: recordingID) }
             }
         }
     }
 
-    private func mixFinished(_ result: Result<Void, Error>, recordingID: UUID) {
+    private func finalizationFinished(_ result: Result<Void, Error>, recordingID: UUID) {
         guard state == .stopping, self.recordingID == recordingID else { return }
         switch result {
         case .failure(let error):
-            failFinalization("audio mix failed: \(error.localizedDescription)")
+            failFinalization("three-track packaging failed: \(error.localizedDescription)")
         case .success:
             publishFinalRecording()
         }
@@ -218,13 +224,13 @@ final class RecordingController: NSObject {
     private func publishFinalRecording() {
         stopWatchdog?.invalidate()
         stopWatchdog = nil
-        guard let captureURL, let finalPartialURL, let telemetryPartialURL, let finalURL else {
+        guard let captureURL, let mixedPartialURL, let finalPartialURL, let telemetryPartialURL, let finalURL else {
             failFinalization("output URLs are missing")
             return
         }
         do {
             guard FileManager.default.fileExists(atPath: finalPartialURL.path) else {
-                throw RecordingError.finalization("mixed partial MP4 is missing")
+                throw RecordingError.finalization("packaged partial MP4 is missing")
             }
             guard !FileManager.default.fileExists(atPath: finalURL.path) else {
                 throw RecordingError.finalization("destination already exists; refusing to overwrite")
@@ -245,6 +251,8 @@ final class RecordingController: NSObject {
             }
             do { try FileManager.default.removeItem(at: captureURL) }
             catch { logger.log("published recording but capture scratch cleanup failed: \(error.localizedDescription)") }
+            do { try FileManager.default.removeItem(at: mixedPartialURL) }
+            catch { logger.log("published recording but mixed scratch cleanup failed: \(error.localizedDescription)") }
             logger.log("recording finalized: \(finalURL.lastPathComponent)")
             resetAfterFinalization()
         } catch {
@@ -427,11 +435,12 @@ final class RecordingController: NSObject {
         } else {
             captureBytes = 0
         }
-        return max(268_435_456, captureBytes + 134_217_728)
+        return max(268_435_456, captureBytes * 2 + 134_217_728)
     }
 
     private func makeOutputURLs() throws -> (
         capture: URL,
+        mixedPartial: URL,
         finalPartial: URL,
         telemetryPartial: URL,
         final: URL
@@ -447,11 +456,12 @@ final class RecordingController: NSObject {
             let final = logger.outputDirectory.appendingPathComponent(name).appendingPathExtension("mp4")
             let telemetry = final.deletingPathExtension().appendingPathExtension("telemetry.json")
             let capture = logger.outputDirectory.appendingPathComponent(".\(name).capture.partial.mov")
-            let finalPartial = logger.outputDirectory.appendingPathComponent(".\(name).mix.partial.mp4")
+            let mixedPartial = logger.outputDirectory.appendingPathComponent(".\(name).mix.partial.mp4")
+            let finalPartial = logger.outputDirectory.appendingPathComponent(".\(name).package.partial.mp4")
             let telemetryPartial = logger.outputDirectory.appendingPathComponent(".\(name).telemetry.partial.json")
-            let candidates = [final, telemetry, capture, finalPartial, telemetryPartial]
+            let candidates = [final, telemetry, capture, mixedPartial, finalPartial, telemetryPartial]
             if candidates.allSatisfy({ !FileManager.default.fileExists(atPath: $0.path) }) {
-                return (capture, finalPartial, telemetryPartial, final)
+                return (capture, mixedPartial, finalPartial, telemetryPartial, final)
             }
             suffix += 1
         }
@@ -466,7 +476,12 @@ final class RecordingController: NSObject {
             systemAudioEnergy: snapshot.systemEnergy,
             microphoneAudioEnergy: snapshot.microphoneEnergy,
             systemAudioRecoveryCount: snapshot.systemAudioRecoveryCount,
-            recorder: "AVAssetWriter+AVAssetReaderAudioMixOutput",
+            recorder: "AVAssetWriter+AVAssetReaderAudioMixOutput+three-trackMP4",
+            audioTrackLayout: [
+                RecordingFinalizer.mixedTrackTitle,
+                RecordingFinalizer.systemTrackTitle,
+                RecordingFinalizer.microphoneTrackTitle
+            ],
             startedAt: startedAt,
             finishedAt: Date()
         )
@@ -487,7 +502,7 @@ final class RecordingController: NSObject {
     }
 
     private func cleanupPartialFiles() {
-        for url in [captureURL, finalPartialURL, telemetryPartialURL].compactMap({ $0 }) where FileManager.default.fileExists(atPath: url.path) {
+        for url in [captureURL, mixedPartialURL, finalPartialURL, telemetryPartialURL].compactMap({ $0 }) where FileManager.default.fileExists(atPath: url.path) {
             do { try FileManager.default.removeItem(at: url) }
             catch { logger.log("partial cleanup failed: \(error.localizedDescription)") }
         }
@@ -498,6 +513,7 @@ final class RecordingController: NSObject {
         streamConfiguration = nil
         selectedMicrophone = nil
         captureURL = nil
+        mixedPartialURL = nil
         finalPartialURL = nil
         telemetryPartialURL = nil
         finalURL = nil
