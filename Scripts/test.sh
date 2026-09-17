@@ -12,6 +12,11 @@ cd "$project_dir"
   Tests/QuietRecorderTests/CoreAudioRouteSnapshotTests.swift \
   -o "$project_dir/.build/tests/CoreAudioRouteSnapshotTests"
 "$project_dir/.build/tests/CoreAudioRouteSnapshotTests"
+sources=(Sources/QuietRecorder/*.swift)
+sources=("${(@)sources:#Sources/QuietRecorder/main.swift}")
+/usr/bin/swiftc "${sources[@]}" Tests/QuietRecorderTests/SleepLifecycleTests.swift \
+  -o "$project_dir/.build/tests/SleepLifecycleTests"
+"$project_dir/.build/tests/SleepLifecycleTests"
 Scripts/build-app.sh
 Acceptance/accept_bundle.sh .build/app/QuietRecorder.app "$project_dir"
 /usr/bin/swiftc -typecheck Acceptance/accept_runtime_visibility.swift

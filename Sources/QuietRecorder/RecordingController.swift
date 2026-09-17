@@ -47,6 +47,8 @@ final class RecordingController: NSObject {
     private var startedAt = Date()
     private var recordingID = UUID()
     private var abortReason: String?
+    private var systemSleeping = false
+    private var stopForSleep = false
     private var diskTimer: Timer?
     private var deviceTimer: Timer?
     private var stopWatchdog: Timer?
@@ -60,22 +62,50 @@ final class RecordingController: NSObject {
 
     override init() {
         super.init()
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(systemWillSleep), name: NSWorkspace.willSleepNotification, object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(systemDidWake), name: NSWorkspace.didWakeNotification, object: nil
+        )
         capturePipeline.failureHandler = { [weak self] reason in
             guard let self else { return }
             DispatchQueue.main.async { self.abortAndStop(reason) }
         }
     }
 
+    @objc func systemWillSleep(_ notification: Notification) {
+        systemSleeping = true
+        guard state != .idle else { return }
+        stopForSleep = true
+        logger.log("system will sleep; stopping recording without automatic resume")
+        // Close the sample gate even while startCapture is still awaiting completion.
+        sampleQueue.sync { capturePipeline.stopAcceptingSamples() }
+        stop()
+        stopWatchdog?.invalidate()
+        stopWatchdog = nil
+    }
+
+    @objc func systemDidWake(_ notification: Notification) {
+        systemSleeping = false
+        logger.log("system woke; recording will not restart automatically")
+        // Sleep time must not consume the finalization timeout.
+        if state == .stopping { scheduleStopWatchdog() }
+    }
+
     func start() async throws {
-        guard state == .idle else { throw RecordingError.alreadyBusy }
+        guard state == .idle, !systemSleeping else { throw RecordingError.alreadyBusy }
+        stopForSleep = false
         transition(to: .starting)
         recordingID = UUID()
         startedAt = Date()
         abortReason = nil
 
         do {
+            try checkStartupNotInterrupted()
             logger.log("permission check: microphone status=\(AVCaptureDevice.authorizationStatus(for: .audio).rawValue)")
             try await PermissionGate.requireMicrophone()
+            try checkStartupNotInterrupted()
             logger.log("permission check: microphone authorized")
             let coreGraphicsPreflight = CGPreflightScreenCaptureAccess()
             logger.log("permission check: CoreGraphics screen preflight=\(coreGraphicsPreflight); ScreenCaptureKit remains authoritative")
@@ -83,6 +113,7 @@ final class RecordingController: NSObject {
 
             logger.log("requesting SCShareableContent")
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            try checkStartupNotInterrupted()
             logger.log("received SCShareableContent")
             guard let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) else {
                 throw RecordingError.mainDisplayUnavailable
@@ -135,18 +166,27 @@ final class RecordingController: NSObject {
             try await stream.startCapture()
             capturePipeline.markCaptureStarted()
             transition(to: .recording)
-            startMonitors()
+            if stopForSleep {
+                stop()
+            } else if state == .recording {
+                startMonitors()
+            }
             logger.log("recording started: \(urls.final.lastPathComponent), recorder=AVAssetWriter")
         } catch {
-            cancelCapturePipeline()
-            cleanupPartialFiles()
-            stream = nil
-            streamConfiguration = nil
-            selectedMicrophone = nil
-            transition(to: .idle)
+            if stopForSleep, captureURL != nil {
+                failFinalization("sleep interrupted capture startup: \(error.localizedDescription)")
+            } else {
+                cancelCapturePipeline()
+                cleanupPartialFiles()
+                resetAfterFinalization()
+            }
             logger.log("recording start failed: \(error.localizedDescription)")
             throw error
         }
+    }
+
+    private func checkStartupNotInterrupted() throws {
+        if stopForSleep || systemSleeping { throw CancellationError() }
     }
 
     func stop() {
@@ -155,25 +195,34 @@ final class RecordingController: NSObject {
         let stoppingRecordingID = recordingID
         stopMonitors()
         logger.log("recording stop requested")
+        sampleQueue.sync { capturePipeline.stopAcceptingSamples() }
         stream?.stopCapture { [weak self] error in
-            guard let self else { return }
-            if let error {
-                DispatchQueue.main.async {
-                    self.abortReason = "ScreenCaptureKit stop error: \(error.localizedDescription)"
-                    self.logger.log(self.abortReason ?? "stop error")
+            DispatchQueue.main.async {
+                guard let self, self.state == .stopping,
+                      self.recordingID == stoppingRecordingID else { return }
+                if let error {
+                    // The writer may still contain a valid recording after stream interruption.
+                    self.logger.log("ScreenCaptureKit stop error; attempting to save captured samples: \(error.localizedDescription)")
                 }
-            }
-            self.sampleQueue.async {
-                self.capturePipeline.finish { result in
-                    DispatchQueue.main.async {
-                        self.captureFinished(result, recordingID: stoppingRecordingID)
+                self.sampleQueue.async {
+                    self.capturePipeline.finish { result in
+                        DispatchQueue.main.async {
+                            self.captureFinished(result, recordingID: stoppingRecordingID)
+                        }
                     }
                 }
             }
         }
+        if !systemSleeping { scheduleStopWatchdog() }
+    }
+
+    private func scheduleStopWatchdog() {
+        stopWatchdog?.invalidate()
+        let stoppingRecordingID = recordingID
         stopWatchdog = Timer.scheduledTimer(withTimeInterval: 120, repeats: false) { [weak self] _ in
             Task { @MainActor in
                 guard let self,
+                      !self.systemSleeping,
                       self.state == .stopping,
                       self.recordingID == stoppingRecordingID else { return }
                 self.abortReason = "recording finalization timed out"
@@ -189,7 +238,7 @@ final class RecordingController: NSObject {
             abortReason = abortReason ?? "capture writer finish failed: \(error.localizedDescription)"
             failFinalization(abortReason ?? error.localizedDescription)
         case .success:
-            guard abortReason == nil, let captureURL, let mixedPartialURL, let finalPartialURL else {
+            guard let captureURL, let mixedPartialURL, let finalPartialURL else {
                 failFinalization(abortReason ?? "finalization URLs are missing")
                 return
             }
@@ -496,8 +545,24 @@ final class RecordingController: NSObject {
         stopWatchdog?.invalidate()
         stopWatchdog = nil
         logger.log("recording finalization failed: \(reason)")
-        cancelCapturePipeline()
-        cleanupPartialFiles()
+        // cancelWriting can remove its output. Copy the source first, on the sample
+        // queue, so an unsuccessful save never deliberately deletes the only copy.
+        sampleQueue.sync {
+            if let captureURL, FileManager.default.fileExists(atPath: captureURL.path) {
+                let recoveryURL = logger.outputDirectory.appendingPathComponent(
+                    "Recovery_\(recordingID.uuidString).mov"
+                )
+                do {
+                    try FileManager.default.copyItem(at: captureURL, to: recoveryURL)
+                    logger.log("unfinished source preserved for recovery: \(recoveryURL.path)")
+                } catch {
+                    logger.log("source backup failed; leaving writer and partial files intact: \(error.localizedDescription)")
+                    return
+                }
+            }
+            capturePipeline.cancel()
+        }
+        // Keep remaining partials too: a completed mix/package may be recoverable.
         resetAfterFinalization()
     }
 

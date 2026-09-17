@@ -36,6 +36,7 @@ final class CapturePipeline: @unchecked Sendable {
     private var sessionStarted = false
     private var sessionStartTime = CMTime.invalid
     private var failureReported = false
+    private var acceptingSamples = false
 
     func prepare(outputURL: URL) throws {
         telemetry.reset()
@@ -84,13 +85,20 @@ final class CapturePipeline: @unchecked Sendable {
             throw writer.error ?? CapturePipelineError.writerStartFailed
         }
 
+        acceptingSamples = true
         self.writer = writer
         self.videoInput = videoInput
         self.systemAudioInput = systemAudioInput
         self.microphoneInput = microphoneInput
     }
 
+    // Call on the sample queue to prevent post-sleep buffers reaching the file.
+    func stopAcceptingSamples() {
+        acceptingSamples = false
+    }
+
     func append(_ sampleBuffer: CMSampleBuffer, type: SCStreamOutputType) {
+        guard acceptingSamples else { return }
         guard CMSampleBufferDataIsReady(sampleBuffer), let writer, writer.status == .writing else {
             if let writer, writer.status == .failed {
                 reportFailure("capture writer failed: \(Self.describe(writer.error))")
@@ -163,9 +171,11 @@ final class CapturePipeline: @unchecked Sendable {
             return
         }
         let context = WriterFinishContext(writer: writer, completion: completion)
-        writer.finishWriting { [weak self, context] in
+        // Detach on the sample queue before asynchronous completion. A late
+        // completion after timeout must never clear a newer recording's writer.
+        resetWriterReferences()
+        writer.finishWriting { [context] in
             context.complete()
-            self?.resetWriterReferences()
         }
     }
 
